@@ -1,4 +1,7 @@
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 public enum ConvertmaxConsent: String, Codable, Sendable { case unknown, granted, denied }
 public enum ConvertmaxEventType: String, Codable, Sendable { case track, identify, screen }
@@ -8,10 +11,13 @@ public struct ConvertmaxConfiguration: Sendable {
     public let appID: String
     public let environment: String
     public let endpoint: URL
+    public let storageDirectory: URL?
 
     public init(writeKey: String, appID: String, environment: String = "production",
-                endpoint: URL = URL(string: "https://event.convertmax.io/v1/batch")!) {
-        self.writeKey = writeKey; self.appID = appID; self.environment = environment; self.endpoint = endpoint
+                endpoint: URL = URL(string: "https://event.convertmax.io/v1/batch")!,
+                storageDirectory: URL? = nil) {
+        self.writeKey = writeKey; self.appID = appID; self.environment = environment
+        self.endpoint = endpoint; self.storageDirectory = storageDirectory
     }
 }
 
@@ -42,7 +48,30 @@ public struct ConvertmaxDeliveryResult: Sendable, Equatable {
     }
 }
 
-/// A deliberately small, enqueue-first API. Networking and durable storage are added behind this stable surface.
+enum MobileV1Ack {
+    struct Body: Decodable {
+        let contract: String
+        let results: [Item]
+        struct Item: Decodable {
+            let messageId: String
+            let status: String
+            let retryable: Bool?
+        }
+    }
+
+    static func droppableMessageIds(httpStatus: Int, body: Data) -> Set<String>? {
+        guard (200..<300).contains(httpStatus),
+              let ack = try? JSONDecoder().decode(Body.self, from: body),
+              ack.contract.lowercased() == "mobile-v1" else { return nil }
+        return Set(ack.results.compactMap { item in
+            if item.status == "accepted" { return item.messageId.lowercased() }
+            if item.status == "rejected", item.retryable != true { return item.messageId.lowercased() }
+            return nil
+        })
+    }
+}
+
+/// Enqueue-first API. StoreKit entitlements and verified revenue stay out of this SDK.
 public actor Convertmax {
     public private(set) var consent: ConvertmaxConsent = .unknown
     private let configuration: ConvertmaxConfiguration
@@ -50,17 +79,20 @@ public actor Convertmax {
     private var userId: String?
     private var queue: [ConvertmaxEvent] = []
     private var dropped = 0
-    private let queueURL: URL
+    private let store: EventStore
+    private var lifecycleObserver: NSObjectProtocol?
 
     public init(configuration: ConvertmaxConfiguration) {
         self.configuration = configuration
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let directory = root.appendingPathComponent("Convertmax", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        self.queueURL = directory.appendingPathComponent("events.json")
-        if let data = try? Data(contentsOf: queueURL), let stored = try? JSONDecoder().decode([ConvertmaxEvent].self, from: data) {
-            self.queue = Array(stored.prefix(1000))
-        }
+        let directory = configuration.storageDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Convertmax", isDirectory: true)
+        self.store = EventStore(directory: directory)
+        self.queue = store.load()
+        Task { await self.installLifecycleAdapter() }
+    }
+
+    deinit {
+        if let lifecycleObserver { NotificationCenter.default.removeObserver(lifecycleObserver) }
     }
 
     public func setConsent(_ value: ConvertmaxConsent) {
@@ -110,10 +142,17 @@ public actor Convertmax {
                 request.setValue("Bearer \(configuration.writeKey)", forHTTPHeaderField: "Authorization")
                 request.setValue("mobile-v1", forHTTPHeaderField: "X-Convertmax-Contract")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = try JSONEncoder().encode(BatchEnvelope(events: batch))
-                let (_, response) = try await URLSession.shared.data(for: request)
-                guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw URLError(.badServerResponse) }
-                queue.removeFirst(batch.count); delivered += batch.count; persist()
+                request.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+                request.httpBody = Gzip.compress(try JSONEncoder().encode(BatchEnvelope(events: batch)))
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse,
+                      let drop = MobileV1Ack.droppableMessageIds(httpStatus: http.statusCode, body: data) else {
+                    throw URLError(.badServerResponse)
+                }
+                let before = queue.count
+                queue.removeAll { drop.contains($0.messageId.uuidString.lowercased()) }
+                delivered += max(0, before - queue.count)
+                persist()
             } catch {
                 if attempts < max(1, maxAttempts) { try? await Task.sleep(nanoseconds: UInt64(250_000_000 * attempts)) }
             }
@@ -128,9 +167,21 @@ public actor Convertmax {
         queue.append(event); persist(); return event
     }
 
-    private func persist() {
-        guard let data = try? JSONEncoder().encode(queue) else { return }
-        try? data.write(to: queueURL, options: [.atomic])
+    private func persist() { store.save(queue) }
+
+    private func installLifecycleAdapter() {
+        #if os(iOS)
+        lifecycleObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task {
+                let task = await MainActor.run { UIApplication.shared.beginBackgroundTask(withName: "convertmax.flush") {} }
+                _ = await self.flushOnBackground()
+                await MainActor.run { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
+            }
+        }
+        #endif
     }
 
     private struct BatchEnvelope: Encodable { let events: [ConvertmaxEvent] }

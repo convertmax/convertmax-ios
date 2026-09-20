@@ -6,7 +6,11 @@ let package = Package(
     platforms: [.iOS(.v15), .macOS(.v12)],
     products: [.library(name: "Convertmax", targets: ["Convertmax"])],
     targets: [
-        .target(name: "Convertmax"),
+        .target(
+            name: "Convertmax",
+            resources: [.process("PrivacyInfo.xcprivacy")],
+            linkerSettings: [.linkedLibrary("sqlite3"), .linkedLibrary("z")]
+        ),
         .testTarget(name: "ConvertmaxTests", dependencies: ["Convertmax"])
     ]
 )

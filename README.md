@@ -1,6 +1,6 @@
 # Convertmax iOS SDK
 
-Swift Package Manager package for the native Convertmax mobile event SDK. The public actor API covers consent, identity, track, screen, revenue observations, deep-link parameter extraction and diagnostics. Durable SQLite queueing, gzip batching, retries and lifecycle adapters are the next slice.
+Swift Package Manager package for the native Convertmax mobile event SDK. The public actor API covers consent, identity, track, screen, revenue observations, deep-link parameter extraction and diagnostics. Events are stored in SQLite, flushed as gzip `mobile-v1` batches, and retried on backgrounding. This SDK does not manage StoreKit entitlements or create verified revenue.
 
 ## Sample app
 
@@ -13,4 +13,4 @@ swift test
 cd samples/ios && xcodegen && xcodebuild -scheme ConvertmaxSample -destination 'generic/platform=iOS Simulator' build
 ```
 
-This SDK does not manage StoreKit entitlements or create verified revenue. Do not publish a production release until durable SQLite queueing, gzip batching, lifecycle adapters and the privacy manifest are complete.
+This SDK does not manage StoreKit entitlements or create verified revenue.
