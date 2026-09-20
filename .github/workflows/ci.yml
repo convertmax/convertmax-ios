@@ -1,0 +1,13 @@
+name: iOS SDK CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test package
+        run: swift test
+      - name: Build Xcode sample
+        run: xcodebuild -project samples/ios/ConvertmaxSample.xcodeproj -scheme ConvertmaxSample -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO
