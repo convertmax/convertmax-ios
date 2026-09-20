@@ -71,7 +71,7 @@ enum MobileV1Ack {
     }
 }
 
-/// Enqueue-first API. StoreKit entitlements and verified revenue stay out of this SDK.
+/// Enqueue-first API.
 public actor Convertmax {
     public private(set) var consent: ConvertmaxConsent = .unknown
     private let configuration: ConvertmaxConfiguration
