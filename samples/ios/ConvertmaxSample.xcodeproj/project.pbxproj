@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 56;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -94,7 +94,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1430;
+				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 				};
 			};
@@ -106,11 +106,9 @@
 				en,
 			);
 			mainGroup = 2642D3FB2BEF25D99D0C6729;
-			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				C679F2005FB856209D9FB186 /* XCLocalSwiftPackageReference "../.." */,
 			);
-			preferredProjectObjectVersion = 77;
 			productRefGroup = A361B306171F303A443B9862 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";

@@ -13,4 +13,4 @@ swift test
 cd samples/ios && xcodegen && xcodebuild -scheme ConvertmaxSample -destination 'generic/platform=iOS Simulator' build
 ```
 
-This SDK does not manage StoreKit entitlements or create verified revenue. Do not publish a production release until durable disk queueing, network delivery, gzip batching, retries, lifecycle adapters and the privacy manifest are complete.
+This SDK does not manage StoreKit entitlements or create verified revenue. Do not publish a production release until durable SQLite queueing, gzip batching, lifecycle adapters and the privacy manifest are complete.
