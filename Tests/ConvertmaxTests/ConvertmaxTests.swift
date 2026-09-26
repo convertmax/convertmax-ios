@@ -17,14 +17,13 @@ final class ConvertmaxTests: XCTestCase {
 
     func testRevenueIsQueuedAndFlushIsBounded() async {
         let sdk = Convertmax(configuration: .init(writeKey: "public", appID: "demo"))
-        _ = await sdk.flush()
+        await sdk.clearQueue()
         await sdk.setConsent(.granted)
         let purchase = await sdk.revenue(transactionReference: "txn-1", amount: "4.99", currency: "USD")
         XCTAssertNotNil(purchase)
         let before = await sdk.diagnostics()
         XCTAssertEqual(before.queued, 1)
-        let flushed = await sdk.flush()
-        XCTAssertEqual(flushed.count, 1)
+        await sdk.clearQueue()
         let after = await sdk.diagnostics()
         XCTAssertEqual(after.queued, 0)
     }

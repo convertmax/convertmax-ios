@@ -185,14 +185,15 @@ public actor Convertmax {
             attempts += 1
             var delay: Double = min(30, pow(2, Double(failures))) + Double.random(in: 0...0.25)
             do {
-                var request = URLRequest(url: configuration.endpoint, timeoutInterval: 15)
-                request.httpMethod = "POST"
-                request.setValue("Bearer \(configuration.writeKey)", forHTTPHeaderField: "Authorization")
-                request.setValue("mobile-v1", forHTTPHeaderField: "X-Convertmax-Contract")
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
+                var builder = URLRequest(url: configuration.endpoint, timeoutInterval: 15)
+                builder.httpMethod = "POST"
+                builder.setValue("Bearer \(configuration.writeKey)", forHTTPHeaderField: "Authorization")
+                builder.setValue("mobile-v1", forHTTPHeaderField: "X-Convertmax-Contract")
+                builder.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                builder.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
                 let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-                request.httpBody = Gzip.compress(try encoder.encode(BatchEnvelope(events: batch)))
+                builder.httpBody = Gzip.compress(try encoder.encode(BatchEnvelope(events: batch)))
+                let request = builder
                 let task = Task { try await URLSession.shared.data(for: request) }
                 uploadTask = task
                 let (data, response) = try await task.value
