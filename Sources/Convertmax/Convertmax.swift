@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 #if os(iOS)
 import UIKit
 #endif
@@ -12,12 +13,15 @@ public struct ConvertmaxConfiguration: Sendable {
     public let environment: String
     public let endpoint: URL
     public let storageDirectory: URL?
+    public let sessionTimeout: TimeInterval
+    public let flushInterval: TimeInterval
 
     public init(writeKey: String, appID: String, environment: String = "production",
                 endpoint: URL = URL(string: "https://event.convertmax.io/v1/batch")!,
-                storageDirectory: URL? = nil) {
+                storageDirectory: URL? = nil, sessionTimeout: TimeInterval = 1800, flushInterval: TimeInterval = 30) {
         self.writeKey = writeKey; self.appID = appID; self.environment = environment
         self.endpoint = endpoint; self.storageDirectory = storageDirectory
+        self.sessionTimeout = max(1, sessionTimeout); self.flushInterval = max(0, flushInterval)
     }
 }
 
@@ -41,10 +45,11 @@ public struct ConvertmaxDiagnostics: Sendable, Equatable {
 
 public struct ConvertmaxDeliveryResult: Sendable, Equatable {
     public let delivered: Int
+    public let rejected: Int
     public let retained: Int
     public let attempts: Int
-    public init(delivered: Int, retained: Int, attempts: Int) {
-        self.delivered = delivered; self.retained = retained; self.attempts = attempts
+    public init(delivered: Int, retained: Int, attempts: Int, rejected: Int = 0) {
+        self.rejected = rejected; self.delivered = delivered; self.retained = retained; self.attempts = attempts
     }
 }
 
@@ -80,28 +85,62 @@ public actor Convertmax {
     private var queue: [ConvertmaxEvent] = []
     private var dropped = 0
     private let store: EventStore
+    public static let version = "0.2.0"
     private var lifecycleObserver: NSObjectProtocol?
+    private var timer: Task<Void, Never>?
+    private var uploadTask: Task<(Data, URLResponse), Error>?
+    private var flushing = false
+    private var generation = 0
+    private var sessionId = UUID().uuidString
+    private var lastActivity = Date.distantPast
+    private var lastError: String?
+
+    struct State: Codable {
+        var consent: ConvertmaxConsent
+        var anonymousId: String
+        var userId: String?
+        var sessionId: String
+        var lastActivity: Date
+    }
 
     public init(configuration: ConvertmaxConfiguration) {
         self.configuration = configuration
         let directory = configuration.storageDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Convertmax", isDirectory: true)
-        self.store = EventStore(directory: directory)
-        self.queue = store.load()
+        let scope = SHA256.hash(data: Data("\(configuration.endpoint)|\(configuration.writeKey)|\(configuration.appID)|\(configuration.environment)".utf8)).map { String(format: "%02x", $0) }.joined()
+        self.store = EventStore(directory: directory.appendingPathComponent(scope, isDirectory: true))
+        if let state = store.loadState() {
+            consent = state.consent; anonymousId = state.anonymousId; userId = state.userId
+            sessionId = state.sessionId; lastActivity = state.lastActivity
+        }
+        self.queue = consent == .granted ? store.load() : []
+        if consent != .granted { store.save([]) }
         Task { await self.installLifecycleAdapter() }
     }
 
     deinit {
+        timer?.cancel(); uploadTask?.cancel()
         if let lifecycleObserver { NotificationCenter.default.removeObserver(lifecycleObserver) }
     }
 
     public func setConsent(_ value: ConvertmaxConsent) {
         consent = value
-        if value != .granted { anonymousId = UUID().uuidString; userId = nil }
+        if value != .granted {
+            generation += 1; uploadTask?.cancel(); queue.removeAll()
+            anonymousId = UUID().uuidString; userId = nil; sessionId = UUID().uuidString; lastActivity = .distantPast
+        }
+        persist()
     }
 
-    public func identify(_ id: String) { guard consent == .granted, !id.isEmpty else { return }; userId = id }
-    public func reset() { userId = nil; anonymousId = UUID().uuidString }
+    @discardableResult public func identify(_ id: String) -> ConvertmaxEvent? {
+        guard consent == .granted, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        if let previous = userId, previous != id { reset() }
+        userId = id
+        return enqueue(make(type: .identify, event: nil, name: nil, properties: [:]))
+    }
+    public func reset() {
+        userId = nil; anonymousId = UUID().uuidString; sessionId = UUID().uuidString; lastActivity = .distantPast; persist()
+    }
 
     public func track(_ name: String, properties: [String: String] = [:]) -> ConvertmaxEvent? {
         guard consent == .granted, !name.isEmpty else { return nil }
@@ -129,47 +168,81 @@ public actor Convertmax {
         }
     }
 
-    public func flush() -> [ConvertmaxEvent] { defer { queue.removeAll(); persist() }; return queue }
+    /// Explicitly discards pending events. Does not change identity or consent.
+    public func clearQueue() { generation += 1; uploadTask?.cancel(); queue.removeAll(); persist() }
+    public func flush() async -> ConvertmaxDeliveryResult { await flushToNetwork() }
     public func flushToNetwork(maxAttempts: Int = 3) async -> ConvertmaxDeliveryResult {
-        var attempts = 0
-        var delivered = 0
-        while attempts < max(1, maxAttempts) && !queue.isEmpty {
+        guard consent == .granted, !flushing else { return .init(delivered: 0, retained: queue.count, attempts: 0) }
+        flushing = true
+        defer { flushing = false; uploadTask = nil }
+        let epoch = generation
+        var attempts = 0, delivered = 0, rejected = 0, failures = 0
+        // Bound this call to the queue present at entry; newly queued events wait for the next flush.
+        let pending = Set(queue.map(\.messageId))
+        while consent == .granted, generation == epoch, failures < max(1, maxAttempts) {
+            let batch = Array(queue.filter { pending.contains($0.messageId) }.prefix(50))
+            if batch.isEmpty { break }
             attempts += 1
-            let batch = Array(queue.prefix(50))
+            var delay: Double = min(30, pow(2, Double(failures))) + Double.random(in: 0...0.25)
             do {
-                var request = URLRequest(url: configuration.endpoint)
+                var request = URLRequest(url: configuration.endpoint, timeoutInterval: 15)
                 request.httpMethod = "POST"
                 request.setValue("Bearer \(configuration.writeKey)", forHTTPHeaderField: "Authorization")
                 request.setValue("mobile-v1", forHTTPHeaderField: "X-Convertmax-Contract")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
-                request.httpBody = Gzip.compress(try JSONEncoder().encode(BatchEnvelope(events: batch)))
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard let http = response as? HTTPURLResponse,
-                      let drop = MobileV1Ack.droppableMessageIds(httpStatus: http.statusCode, body: data) else {
-                    throw URLError(.badServerResponse)
+                let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+                request.httpBody = Gzip.compress(try encoder.encode(BatchEnvelope(events: batch)))
+                let task = Task { try await URLSession.shared.data(for: request) }
+                uploadTask = task
+                let (data, response) = try await task.value
+                guard generation == epoch, consent == .granted else { break }
+                guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                if let seconds = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) { delay = min(60, max(0, seconds)) }
+                if http.statusCode == 401 || http.statusCode == 403 || http.statusCode == 413 {
+                    lastError = "HTTP \(http.statusCode): check configuration or event size"; break
                 }
-                let before = queue.count
-                queue.removeAll { drop.contains($0.messageId.uuidString.lowercased()) }
-                delivered += max(0, before - queue.count)
+                guard let drop = MobileV1Ack.droppableMessageIds(httpStatus: http.statusCode, body: data),
+                      let ack = try? JSONDecoder().decode(MobileV1Ack.Body.self, from: data) else { throw URLError(.badServerResponse) }
+                let ids = Set(batch.map { $0.messageId.uuidString.lowercased() })
+                let accepted = Set(ack.results.filter { $0.status == "accepted" }.map { $0.messageId.lowercased() }).intersection(ids)
+                let remove = drop.intersection(ids)
+                delivered += accepted.count; rejected += remove.subtracting(accepted).count
+                queue.removeAll { remove.contains($0.messageId.uuidString.lowercased()) }
                 persist()
-            } catch {
-                if attempts < max(1, maxAttempts) { try? await Task.sleep(nanoseconds: UInt64(250_000_000 * attempts)) }
+                if remove.count == batch.count { failures = 0; lastError = nil; continue }
+                lastError = "Retryable or incomplete acknowledgement"
+            } catch { lastError = String(describing: error) }
+            failures += 1
+            if failures < max(1, maxAttempts), generation == epoch, consent == .granted {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
-        return ConvertmaxDeliveryResult(delivered: delivered, retained: queue.count, attempts: attempts)
+        return .init(delivered: delivered, retained: queue.count, attempts: attempts, rejected: rejected)
     }
+    public func deliveryError() -> String? { lastError }
     public func flushOnBackground() async { _ = await flushToNetwork() }
     public func diagnostics() -> ConvertmaxDiagnostics { ConvertmaxDiagnostics(queued: queue.count, dropped: dropped) }
 
     private func enqueue(_ event: ConvertmaxEvent) -> ConvertmaxEvent? {
-        guard queue.count < 1000 else { dropped += 1; return nil }
+        guard queue.count < 1000, (try? JSONEncoder().encode(event).count).map({ $0 <= 16384 }) == true else { dropped += 1; return nil }
         queue.append(event); persist(); return event
     }
 
-    private func persist() { store.save(queue) }
+    private func persist() {
+        store.save(queue, state: State(consent: consent, anonymousId: anonymousId, userId: userId, sessionId: sessionId, lastActivity: lastActivity))
+    }
 
     private func installLifecycleAdapter() {
+        if configuration.flushInterval > 0 {
+            let interval = configuration.flushInterval
+            timer = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000)) } catch { break }
+                    _ = await self?.flushToNetwork()
+                }
+            }
+        }
         #if os(iOS)
         lifecycleObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
@@ -187,7 +260,21 @@ public actor Convertmax {
     private struct BatchEnvelope: Encodable { let events: [ConvertmaxEvent] }
 
     private func make(type: ConvertmaxEventType, event: String?, name: String?, properties: [String: String]) -> ConvertmaxEvent {
-        ConvertmaxEvent(messageId: UUID(), type: type, event: event, name: name, timestamp: Date(), anonymousId: anonymousId,
-                        userId: userId, properties: properties, context: ["appId": configuration.appID, "environment": configuration.environment])
+        let now = Date()
+        if now.timeIntervalSince(lastActivity) >= configuration.sessionTimeout { sessionId = UUID().uuidString }
+        lastActivity = now
+        var context = ["appId": configuration.appID, "environment": configuration.environment,
+                       "sessionId": sessionId, "sdkVersion": Self.version, "sdkName": "convertmax-swift",
+                       "osVersion": ProcessInfo.processInfo.operatingSystemVersionString,
+                       "locale": Locale.current.identifier, "timezone": TimeZone.current.identifier,
+                       "appVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "",
+                       "appBuild": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""]
+        #if os(iOS)
+        context["platform"] = "ios"
+        #else
+        context["platform"] = "macos"
+        #endif
+        return ConvertmaxEvent(messageId: UUID(), type: type, event: event, name: name, timestamp: Date(), anonymousId: anonymousId,
+                        userId: userId, properties: properties, context: context)
     }
 }

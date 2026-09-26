@@ -12,6 +12,8 @@ final class EventStore {
             return
         }
         sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS events (message_id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);", nil, nil, nil)
+        sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS sdk_state (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);", nil, nil, nil)
+        sqlite3_exec(db, "PRAGMA secure_delete=ON;", nil, nil, nil)
         migrateJSON(from: directory)
     }
 
@@ -32,9 +34,21 @@ final class EventStore {
         return Array(events.prefix(1000))
     }
 
-    func save(_ events: [ConvertmaxEvent]) {
+    func loadState() -> Convertmax.State? {
+        guard let db else { return nil }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT payload FROM sdk_state WHERE id=1", -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else { return nil }
+        return try? JSONDecoder().decode(Convertmax.State.self, from: Data(String(cString: text).utf8))
+    }
+
+    func save(_ events: [ConvertmaxEvent], state: Convertmax.State? = nil) {
         guard let db else { return }
-        sqlite3_exec(db, "DELETE FROM events;", nil, nil, nil)
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
+        var committed = false
+        defer { if !committed { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) } }
+        guard sqlite3_exec(db, "DELETE FROM events;", nil, nil, nil) == SQLITE_OK else { return }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, "INSERT INTO events(message_id, payload, created_at) VALUES (?, ?, ?);", -1, &statement, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(statement) }
@@ -43,9 +57,18 @@ final class EventStore {
             sqlite3_bind_text(statement, 1, event.messageId.uuidString, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(statement, 2, json, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int64(statement, 3, Int64(index))
-            sqlite3_step(statement)
+            guard sqlite3_step(statement) == SQLITE_DONE else { return }
             sqlite3_reset(statement)
         }
+        if let state {
+            guard let data = try? JSONEncoder().encode(state), let json = String(data: data, encoding: .utf8) else { return }
+            var update: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO sdk_state(id,payload) VALUES (1,?)", -1, &update, nil) == SQLITE_OK else { return }
+            defer { sqlite3_finalize(update) }
+            sqlite3_bind_text(update, 1, json, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(update) == SQLITE_DONE else { return }
+        }
+        committed = sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
     }
 
     private func migrateJSON(from directory: URL) {
