@@ -76,6 +76,21 @@ enum MobileV1Ack {
     }
 }
 
+#if os(iOS)
+/// Owns a UIKit background task identifier and ends it at most once.
+@MainActor
+final class BackgroundFlushToken {
+    var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var ended = false
+
+    func end() {
+        guard !ended else { return }
+        ended = true
+        if identifier != .invalid { UIApplication.shared.endBackgroundTask(identifier) }
+    }
+}
+#endif
+
 /// Enqueue-first API.
 public actor Convertmax {
     public private(set) var consent: ConvertmaxConsent = .unknown
@@ -179,8 +194,11 @@ public actor Convertmax {
         var attempts = 0, delivered = 0, rejected = 0, failures = 0
         // Bound this call to the queue present at entry; newly queued events wait for the next flush.
         let pending = Set(queue.map(\.messageId))
+        // Events the server answered as retryable stay queued, but are skipped for the rest of this
+        // call so they cannot block the events behind them (head-of-line blocking).
+        var answered = Set<UUID>()
         while consent == .granted, generation == epoch, failures < max(1, maxAttempts) {
-            let batch = Array(queue.filter { pending.contains($0.messageId) }.prefix(50))
+            let batch = Array(queue.filter { pending.contains($0.messageId) && !answered.contains($0.messageId) }.prefix(50))
             if batch.isEmpty { break }
             attempts += 1
             var delay: Double = min(30, pow(2, Double(failures))) + Double.random(in: 0...0.25)
@@ -192,7 +210,10 @@ public actor Convertmax {
                 builder.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 builder.setValue("gzip", forHTTPHeaderField: "Content-Encoding")
                 let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-                builder.httpBody = Gzip.compress(try encoder.encode(BatchEnvelope(events: batch)))
+                guard let body = Gzip.compress(try encoder.encode(BatchEnvelope(events: batch))) else {
+                    throw URLError(.cannotDecodeContentData)
+                }
+                builder.httpBody = body
                 let request = builder
                 let task = Task { try await URLSession.shared.data(for: request) }
                 uploadTask = task
@@ -210,6 +231,7 @@ public actor Convertmax {
                 let remove = drop.intersection(ids)
                 delivered += accepted.count; rejected += remove.subtracting(accepted).count
                 queue.removeAll { remove.contains($0.messageId.uuidString.lowercased()) }
+                answered.formUnion(batch.map(\.messageId))
                 persist()
                 if remove.count == batch.count { failures = 0; lastError = nil; continue }
                 lastError = "Retryable or incomplete acknowledgement"
@@ -223,6 +245,13 @@ public actor Convertmax {
     }
     public func deliveryError() -> String? { lastError }
     public func flushOnBackground() async { _ = await flushToNetwork() }
+
+    /// Called when the background-task budget expires. Cancels the in-flight upload and any retry
+    /// loop; queued events stay persisted for the next flush.
+    func abortFlushForBackgroundExpiry() {
+        generation += 1
+        uploadTask?.cancel()
+    }
     public func diagnostics() -> ConvertmaxDiagnostics { ConvertmaxDiagnostics(queued: queue.count, dropped: dropped) }
 
     private func enqueue(_ event: ConvertmaxEvent) -> ConvertmaxEvent? {
@@ -250,9 +279,18 @@ public actor Convertmax {
         ) { [weak self] _ in
             guard let self else { return }
             Task {
-                let task = await MainActor.run { UIApplication.shared.beginBackgroundTask(withName: "convertmax.flush") {} }
+                let token = await MainActor.run { BackgroundFlushToken() }
+                await MainActor.run {
+                    token.identifier = UIApplication.shared.beginBackgroundTask(withName: "convertmax.flush") {
+                        // iOS is about to suspend us: stop the upload, keep events queued, and end the task.
+                        Task {
+                            await self.abortFlushForBackgroundExpiry()
+                            await MainActor.run { token.end() }
+                        }
+                    }
+                }
                 _ = await self.flushOnBackground()
-                await MainActor.run { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
+                await MainActor.run { token.end() }
             }
         }
         #endif
