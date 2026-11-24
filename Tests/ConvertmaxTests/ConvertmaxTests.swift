@@ -1,9 +1,16 @@
 import XCTest
+import SQLite3
 @testable import Convertmax
 
 final class ConvertmaxTests: XCTestCase {
+    // Each test gets its own storage directory so persisted consent from earlier runs cannot leak in.
+    private func freshConfiguration() -> ConvertmaxConfiguration {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        return ConvertmaxConfiguration(writeKey: "public", appID: "demo", storageDirectory: dir)
+    }
+
     func testConsentAndIdentityBoundaries() async {
-        let sdk = Convertmax(configuration: .init(writeKey: "public", appID: "demo"))
+        let sdk = Convertmax(configuration: freshConfiguration())
         let beforeConsent = await sdk.track("opened")
         XCTAssertNil(beforeConsent)
         await sdk.setConsent(.granted)
@@ -16,7 +23,7 @@ final class ConvertmaxTests: XCTestCase {
     }
 
     func testRevenueIsQueuedAndFlushIsBounded() async {
-        let sdk = Convertmax(configuration: .init(writeKey: "public", appID: "demo"))
+        let sdk = Convertmax(configuration: freshConfiguration())
         await sdk.clearQueue()
         await sdk.setConsent(.granted)
         let purchase = await sdk.revenue(transactionReference: "txn-1", amount: "4.99", currency: "USD")
@@ -54,8 +61,52 @@ final class ConvertmaxTests: XCTestCase {
         XCTAssertEqual(diagnostics.queued, 1)
     }
 
+    func testIncrementalWritesPersistInsertsAndDeletes() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let config = ConvertmaxConfiguration(writeKey: "public", appID: "demo", storageDirectory: dir)
+        let first = Convertmax(configuration: config)
+        await first.setConsent(.granted)
+        _ = await first.track("one")
+        _ = await first.track("two")
+        await first.clearQueue()
+        _ = await first.track("three")
+        let second = Convertmax(configuration: config)
+        let diagnostics = await second.diagnostics()
+        XCTAssertEqual(diagnostics.queued, 1)
+    }
+
     func testGzipPayloadHasGzipMagic() {
         let compressed = Gzip.compress(Data("convertmax".utf8))
-        XCTAssertEqual(compressed.prefix(2), Data([0x1f, 0x8b]))
+        XCTAssertEqual(compressed?.prefix(2), Data([0x1f, 0x8b]))
+    }
+
+    func testGzipReturnsNilForEmptyInput() {
+        // Callers must not label a body as gzip when compression did not happen.
+        XCTAssertNil(Gzip.compress(Data()))
+    }
+
+    func testUnreadableRowsAreNotPurgedBySave() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let store = EventStore(directory: dir)
+        XCTAssertTrue(store.load().isEmpty)
+
+        // Simulate a row written by an older schema that the current decoder cannot read.
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(dir.appendingPathComponent("events.sqlite").path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "INSERT INTO events VALUES ('legacy-1', '{\"old\":true}', 0);", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+
+        let reloaded = EventStore(directory: dir)
+        XCTAssertTrue(reloaded.load().isEmpty)
+        reloaded.save([])
+
+        var check: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(dir.appendingPathComponent("events.sqlite").path, &check), SQLITE_OK)
+        var count: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(check, "SELECT COUNT(*) FROM events WHERE message_id = 'legacy-1';", -1, &count, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(count), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(count, 0), 1)
+        sqlite3_finalize(count)
+        sqlite3_close(check)
     }
 }

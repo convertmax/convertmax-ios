@@ -3,6 +3,10 @@ import SQLite3
 
 final class EventStore {
     private var db: OpaquePointer?
+    /// Message IDs of decodable event rows currently stored. Used to write only the difference.
+    private var persistedIDs: Set<String> = []
+    /// Next `created_at` sequence value; keeps insertion order across launches.
+    private var nextSequence: Int64 = 0
 
     init(directory: URL) {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -22,16 +26,24 @@ final class EventStore {
     func load() -> [ConvertmaxEvent] {
         guard let db else { return [] }
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT payload FROM events ORDER BY created_at ASC;", -1, &statement, nil) == SQLITE_OK else { return [] }
+        guard sqlite3_prepare_v2(db, "SELECT message_id, payload, created_at FROM events ORDER BY created_at ASC;", -1, &statement, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(statement) }
         var events: [ConvertmaxEvent] = []
+        persistedIDs = []
+        var maxSequence: Int64 = -1
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let text = sqlite3_column_text(statement, 0) {
-                let data = Data(bytes: text, count: Int(sqlite3_column_bytes(statement, 0)))
-                if let event = try? JSONDecoder().decode(ConvertmaxEvent.self, from: data) { events.append(event) }
+            let messageId = sqlite3_column_text(statement, 0).map { String(cString: $0) } ?? ""
+            maxSequence = max(maxSequence, sqlite3_column_int64(statement, 2))
+            guard let text = sqlite3_column_text(statement, 1) else { continue }
+            if let event = try? JSONDecoder().decode(ConvertmaxEvent.self, from: Data(String(cString: text).utf8)) {
+                events.append(event)
+                persistedIDs.insert(messageId)
+            } else {
+                // Not in persistedIDs, so save never deletes it: a later SDK version can still read it.
             }
         }
-        return Array(events.prefix(1000))
+        nextSequence = maxSequence + 1
+        return events
     }
 
     func loadState() -> Convertmax.State? {
@@ -43,23 +55,40 @@ final class EventStore {
         return try? JSONDecoder().decode(Convertmax.State.self, from: Data(String(cString: text).utf8))
     }
 
+    /// Writes only the difference from what is stored: new events are inserted, events no longer
+    /// queued are deleted, and the SDK state is upserted. Event payloads are immutable, so existing
+    /// rows are never rewritten.
     func save(_ events: [ConvertmaxEvent], state: Convertmax.State? = nil) {
         guard let db else { return }
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
         var committed = false
         defer { if !committed { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) } }
-        guard sqlite3_exec(db, "DELETE FROM events;", nil, nil, nil) == SQLITE_OK else { return }
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "INSERT INTO events(message_id, payload, created_at) VALUES (?, ?, ?);", -1, &statement, nil) == SQLITE_OK else { return }
-        defer { sqlite3_finalize(statement) }
-        for (index, event) in events.enumerated() {
-            guard let payload = try? JSONEncoder().encode(event), let json = String(data: payload, encoding: .utf8) else { continue }
-            sqlite3_bind_text(statement, 1, event.messageId.uuidString, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_text(statement, 2, json, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_int64(statement, 3, Int64(index))
-            guard sqlite3_step(statement) == SQLITE_DONE else { return }
-            sqlite3_reset(statement)
+
+        let currentIDs = Set(events.map { $0.messageId.uuidString })
+        var sequence = nextSequence
+
+        var delete: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM events WHERE message_id = ?;", -1, &delete, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(delete) }
+        for id in persistedIDs.subtracting(currentIDs) {
+            sqlite3_bind_text(delete, 1, id, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(delete) == SQLITE_DONE else { return }
+            sqlite3_reset(delete)
         }
+
+        var insert: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT INTO events(message_id, payload, created_at) VALUES (?, ?, ?);", -1, &insert, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(insert) }
+        for event in events where !persistedIDs.contains(event.messageId.uuidString) {
+            guard let payload = try? JSONEncoder().encode(event), let json = String(data: payload, encoding: .utf8) else { continue }
+            sqlite3_bind_text(insert, 1, event.messageId.uuidString, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(insert, 2, json, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int64(insert, 3, sequence)
+            guard sqlite3_step(insert) == SQLITE_DONE else { return }
+            sqlite3_reset(insert)
+            sequence += 1
+        }
+
         if let state {
             guard let data = try? JSONEncoder().encode(state), let json = String(data: data, encoding: .utf8) else { return }
             var update: OpaquePointer?
@@ -68,7 +97,12 @@ final class EventStore {
             sqlite3_bind_text(update, 1, json, -1, SQLITE_TRANSIENT)
             guard sqlite3_step(update) == SQLITE_DONE else { return }
         }
+
         committed = sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
+        if committed {
+            persistedIDs = currentIDs
+            nextSequence = sequence
+        }
     }
 
     private func migrateJSON(from directory: URL) {
