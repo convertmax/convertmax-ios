@@ -1,4 +1,4 @@
-# Convertmax iOS SDK (0.2.0)
+# Convertmax iOS SDK (0.3.0)
 
 Swift Package Manager package for the native Convertmax mobile event SDK. The public actor API covers consent, identity, track, screen, revenue observations, deep-link parameter extraction and diagnostics. Events are stored in SQLite, flushed as gzip `mobile-v1` batches, and retried on backgrounding.
 

@@ -100,7 +100,7 @@ public actor Convertmax {
     private var queue: [ConvertmaxEvent] = []
     private var dropped = 0
     private let store: EventStore
-    public static let version = "0.2.0"
+    public static let version = "0.3.0"
     private var lifecycleObserver: NSObjectProtocol?
     private var timer: Task<Void, Never>?
     private var uploadTask: Task<(Data, URLResponse), Error>?
